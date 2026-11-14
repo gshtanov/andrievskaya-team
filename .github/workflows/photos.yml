@@ -1,0 +1,78 @@
+# Скачивает фото проектов (из постов Telegram-канала) и портреты команды (со старого сайта)
+# в assets/media/ и переписывает ссылки на локальные. Запускается вручную:
+# вкладка Actions → «Фото в проект» → Run workflow, или `gh workflow run photos.yml`.
+# Нужен потому, что Telegram открывается не отовсюду, а серверы GitHub до него достают.
+name: Фото в проект
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: photos
+  cancel-in-progress: false
+
+jobs:
+  photos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Скачать фото
+        run: node tools/photos.mjs --download
+
+      - name: Проверить, что всё на месте
+        run: |
+          set -euo pipefail
+          frames=$(find assets/media -maxdepth 1 -type f -name '*.jpg' | wc -l)
+          team=$(find assets/media/team -type f | wc -l)
+          echo "Кадров: $frames из 26, портретов: $team из 12" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$frames" -eq 26
+          test "$team" -eq 12
+          if grep -nE 'telesco\.pe|tildacdn' data/media.js data/content.js; then
+            echo "В data/ остались внешние ссылки"; exit 1
+          fi
+          if file -b --mime-type assets/media/*.jpg assets/media/team/* | grep -v '^image/'; then
+            echo "Среди файлов есть не картинки"; exit 1
+          fi
+          du -sh assets/media | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Сравнить с прежними ссылками
+        continue-on-error: true
+        run: |
+          node --input-type=module - <<'JS' | tee -a "$GITHUB_STEP_SUMMARY"
+          import { readFile } from 'node:fs/promises';
+          import { createHash } from 'node:crypto';
+          import { runInNewContext } from 'node:vm';
+          import { execSync } from 'node:child_process';
+          const ctx = { window: {} };
+          runInNewContext(execSync('git show HEAD:data/media.js', { encoding: 'utf8' }), ctx);
+          const sha = (b) => createHash('sha256').update(b).digest('hex');
+          let same = 0; const diff = [], gone = [];
+          for (const [k, u] of Object.entries(ctx.window.MEDIA || {})) {
+            if (!/^https?:/.test(u)) continue;
+            const r = await fetch(u).catch(() => null);
+            if (!r || !r.ok) { gone.push(k); continue; }
+            const a = sha(Buffer.from(await r.arrayBuffer()));
+            const b = sha(await readFile(`assets/media/${k}.jpg`));
+            if (a === b) same++; else diff.push(k);
+          }
+          console.log(`Совпадают с прежними ссылками: ${same}. Отличаются: ${diff.join(', ') || 'нет'}. Прежняя ссылка не открылась: ${gone.join(', ') || 'нет'}.`);
+          JS
+
+      - name: Закоммитить фото
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add assets/media data/media.js data/content.js
+          if git diff --cached --quiet; then echo 'Изменений нет'; exit 0; fi
+          git commit -m 'Фото в проекте: кадры и портреты команды в assets/media' \
+            -m 'Скачано заданием «Фото в проект» (tools/photos.mjs --download): сайт больше не зависит от серверов Telegram и Tilda.'
+          git push

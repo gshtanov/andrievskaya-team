@@ -10,6 +10,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 
 const CHANNEL = 'andrievskaya_sport';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,46 +44,72 @@ const photosOf = (html) => {
 const save = async (url, file) => {
   const r = await fetch(url, { headers: UA });
   if (!r.ok) throw new Error(`${r.status} ${url}`);
+  if (!/^image\//.test(r.headers.get('content-type') || '')) throw new Error(`не картинка: ${url}`);
   await writeFile(join(ROOT, file), Buffer.from(await r.arrayBuffer()));
   return file.replace(/\\/g, '/');
 };
 
+/** Ссылки, которые уже записаны в data/media.js: запасной вариант, если пост не разобрался */
+async function current() {
+  try {
+    const ctx = { window: {} };
+    runInNewContext(await readFile(join(ROOT, 'data/media.js'), 'utf8'), ctx);
+    return ctx.window.MEDIA || {};
+  } catch { return {}; }
+}
+
+const failed = [];
+
 async function media() {
+  const prev = await current();
   const cache = new Map();
   const out = {};
   for (const [key, [id, n]] of Object.entries(MEDIA)) {
     if (!cache.has(id)) cache.set(id, photosOf(await get(`https://t.me/${CHANNEL}/${id}?embed=1&mode=tme`).catch(() => '')));
-    const url = cache.get(id)[n];
-    if (!url) { console.warn(`  нет кадра: ${key} (пост ${id})`); continue; }
+    const url = cache.get(id)[n] || prev[key];
+    if (!cache.get(id)[n]) console.warn(`  нет кадра в посте: ${key} (пост ${id})${prev[key] ? ' — оставляю прежнюю ссылку' : ''}`);
+    if (!url) { failed.push(key); continue; }
     out[key] = url;
   }
   if (DOWNLOAD) {
     await mkdir(join(ROOT, 'assets/media'), { recursive: true });
-    for (const [key, url] of Object.entries(out)) out[key] = await save(url, `assets/media/${key}.jpg`).catch(() => url);
+    for (const [key, url] of Object.entries(out)) {
+      if (!/^https?:/.test(url)) continue; /* уже лежит в проекте */
+      const file = `assets/media/${key}.jpg`;
+      /* свежая ссылка из поста не скачалась — пробуем ту, что была в data/media.js */
+      const fallback = /^https?:/.test(prev[key] || '') && prev[key] !== url ? prev[key] : null;
+      const local = await save(url, file).catch(() => (fallback ? save(fallback, file) : Promise.reject())).catch(() => null);
+      if (local) out[key] = local; else failed.push(key);
+    }
   }
   await writeFile(join(ROOT, 'data/media.js'), `/* Сгенерировано tools/photos.mjs — не редактировать вручную */\nwindow.MEDIA = ${JSON.stringify(out, null, 1)};\n`, 'utf8');
-  return Object.keys(out).length;
+  return Object.values(out).filter((u) => !DOWNLOAD || !/^https?:/.test(u)).length;
 }
 
 /** --download: портреты команды со старого сайта переносим в проект и правим ссылки в data/content.js */
 async function team() {
   const file = join(ROOT, 'data/content.js');
   let text = await readFile(file, 'utf8');
-  const urls = [...new Set(text.match(/https:\/\/static\.tildacdn\.com\/[^'"\s]+/g) || [])];
+  const urls = [...new Set(text.match(/https:\/\/static\.tildacdn\.(?:com|info)\/[^'"\s]+/g) || [])];
   if (!urls.length) return 0;
   await mkdir(join(ROOT, 'assets/media/team'), { recursive: true });
-  let i = 0;
+  let i = 0, saved = 0;
   for (const url of urls) {
     const ext = (url.match(/\.(png|jpe?g|webp)$/i) || ['.jpg'])[0].toLowerCase();
     const name = `assets/media/team/${String(++i).padStart(2, '0')}${ext}`;
     /* основной сервер Tilda бывает недоступен — тогда берём зеркало */
-    const local = await save(url, name).catch(() => save(url.replace('static.tildacdn.com', 'static.tildacdn.info'), name)).catch(() => null);
-    if (local) text = text.split(url).join(local);
+    const com = url.replace('static.tildacdn.info', 'static.tildacdn.com');
+    const local = await save(com, name).catch(() => save(com.replace('static.tildacdn.com', 'static.tildacdn.info'), name)).catch(() => null);
+    if (local) { text = text.split(url).join(local); saved++; } else failed.push(url);
   }
   await writeFile(file, text, 'utf8');
-  return i;
+  return saved;
 }
 
 const m = await media();
 const t = DOWNLOAD ? await team() : 0;
 console.log(`Готово: кадров — ${m}${DOWNLOAD ? `, портретов команды — ${t} (фото сохранены в assets/media/)` : ''}`);
+if (failed.length) {
+  console.error(`Не получилось (${failed.length}):\n  ${failed.join('\n  ')}`);
+  process.exitCode = 1;
+}
