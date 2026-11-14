@@ -31,14 +31,17 @@ jobs:
       - name: Проверить, что всё на месте
         run: |
           set -euo pipefail
-          frames=$(find assets/media -maxdepth 1 -type f -name '*.jpg' | wc -l)
-          team=$(find assets/media/team -type f | wc -l)
-          echo "Кадров: $frames из 26, портретов: $team из 12" | tee -a "$GITHUB_STEP_SUMMARY"
-          test "$frames" -eq 26
-          test "$team" -eq 12
           if grep -nE 'telesco\.pe|tildacdn' data/media.js data/content.js; then
             echo "В data/ остались внешние ссылки"; exit 1
           fi
+          # каждая ссылка из data/ ведёт на непустой файл в проекте
+          refs=$(grep -ohE 'assets/media/[A-Za-z0-9_./-]+\.(jpe?g|png|webp)' data/media.js data/content.js | sort -u)
+          missing=0
+          for f in $refs; do test -s "$f" || { echo "Нет файла: $f"; missing=1; }; done
+          frames=$(grep -c '^assets/media/[^/]*$' <<< "$refs" || true)
+          team=$(grep -c '^assets/media/team/' <<< "$refs" || true)
+          echo "Кадров: $frames, портретов: $team" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$missing" -eq 0
           if file -b --mime-type assets/media/*.jpg assets/media/team/* | grep -v '^image/'; then
             echo "Среди файлов есть не картинки"; exit 1
           fi
